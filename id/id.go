@@ -2,6 +2,7 @@ package id
 
 import (
 	"crypto/rand"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 )
@@ -23,34 +24,6 @@ func New() (ID, error) {
 	return id, nil
 }
 
-// String returns a hex-encoded string.
-func (id ID) String() string {
-	return hex.EncodeToString(id[:])
-}
-
-// MarshalText returns a hex-encoded slice of bytes.
-func (id ID) MarshalText() (text []byte, err error) {
-	data := make([]byte, hex.EncodedLen(len(id)))
-	hex.Encode(data, id[:])
-	return data, nil
-}
-
-// UnmarshalText sets the value of the ID based on a hex-encoded slice of bytes.
-func (id *ID) UnmarshalText(text []byte) error {
-	data := make([]byte, hex.DecodedLen(len(text)))
-	n, err := hex.Decode(data, text)
-	if err != nil {
-		return err
-	}
-
-	if n != len(id) {
-		return InvalidIDError
-	}
-
-	copy(id[:], data)
-	return nil
-}
-
 // MarshalBinary returns a slice of bytes.
 func (id ID) MarshalBinary() ([]byte, error) {
 	return id[:], nil
@@ -66,6 +39,28 @@ func (id *ID) UnmarshalBinary(data []byte) error {
 	return nil
 }
 
+// MarshalText returns a hex-encoded slice of bytes.
+func (id ID) MarshalText() (text []byte, err error) {
+	data := make([]byte, hex.EncodedLen(len(id)))
+	hex.Encode(data, id[:])
+	return data, nil
+}
+
+// UnmarshalText sets the value of the ID based on a hex-encoded slice of bytes.
+func (id *ID) UnmarshalText(text []byte) error {
+	data := make([]byte, hex.DecodedLen(len(text)))
+	if _, err := hex.Decode(data, text); err != nil {
+		return err
+	}
+
+	return id.UnmarshalBinary(data)
+}
+
+// String returns a hex-encoded string.
+func (id ID) String() string {
+	return hex.EncodeToString(id[:])
+}
+
 // Scan sets the value of the ID based on an interface.
 func (id *ID) Scan(src interface{}) error {
 	data, ok := src.([]byte)
@@ -74,4 +69,8 @@ func (id *ID) Scan(src interface{}) error {
 	}
 
 	return id.UnmarshalBinary(data)
+}
+
+func (id ID) Value() (driver.Value, error) {
+	return id[:], nil
 }
