@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"encoding"
 	"encoding/gob"
 	"errors"
 	"time"
@@ -41,8 +42,29 @@ var (
 	tokenBucketScript      = redis.NewScript(1, tokenBucket)
 )
 
+func interfaceToString(v interface{}) (string, error) {
+	switch v := v.(type) {
+	default:
+		return "", errors.New("Must provide a string-like object")
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	case encoding.TextMarshaler:
+		bytes, err := v.MarshalText()
+		if err != nil {
+			return "", err
+		}
+		return string(bytes), nil
+	}
+}
+
 func sessionKey(sessionID id.ID) string {
 	return "s" + sessionID.String()
+}
+
+func groupKey(groupId string) string {
+	return "g" + groupId
 }
 
 func rateLimitKey(client string) string {
@@ -114,7 +136,7 @@ func (r *SessionStore) Session(sessionID id.ID, session interface{}) error {
 	return gob.NewDecoder(bytes.NewBuffer(reply)).Decode(session)
 }
 
-func (r *SessionStore) SetSession(sessionID id.ID, session interface{}) error {
+func (r *SessionStore) SetSession(sessionID id.ID, groupId interface{}, session interface{}) error {
 	conn := r.pool.Get()
 	defer conn.Close()
 
@@ -123,16 +145,77 @@ func (r *SessionStore) SetSession(sessionID id.ID, session interface{}) error {
 		return err
 	}
 
-	_, err := conn.Do("SETEX", sessionKey(sessionID), r.sessionDuration, encodedSession)
-	return err
+	sKey := sessionKey(sessionID)
+
+	if _, err := conn.Do("SETEX", sKey, r.sessionDuration, encodedSession); err != nil {
+		return err
+	}
+
+	if groupId != nil {
+		groupIdStr, err := interfaceToString(groupId)
+		if err != nil {
+			return err
+		}
+		gKey := groupKey(groupIdStr)
+
+		if _, err := conn.Do("SADD", gKey, sKey); err != nil {
+			return err
+		}
+
+		if _, err := conn.Do("EXPIRE", gKey, r.sessionDuration); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (r *SessionStore) DeleteSession(sessionID id.ID) error {
+func (r *SessionStore) InvalidateSessions(groupId interface{}) error {
 	conn := r.pool.Get()
 	defer conn.Close()
 
-	_, err := conn.Do("DEL", sessionKey(sessionID))
-	return err
+	groupIdStr, err := interfaceToString(groupId)
+	if err != nil {
+		return err
+	}
+	gKey := groupKey(groupIdStr)
+
+	// TODO: use sscan for safety
+	members, err := redis.Strings(conn.Do("SMEMBERS", gKey))
+	if err != nil {
+		return err
+	}
+
+	if _, err := conn.Do("DEL", redis.Args{}.Add(gKey).AddFlat(members)...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *SessionStore) DeleteSession(sessionID id.ID, groupId interface{}) error {
+	conn := r.pool.Get()
+	defer conn.Close()
+
+	sKey := sessionKey(sessionID)
+
+	if _, err := conn.Do("DEL", sKey); err != nil {
+		return err
+	}
+
+	if groupId != nil {
+		groupIdStr, err := interfaceToString(groupId)
+		if err != nil {
+			return err
+		}
+		gKey := groupKey(groupIdStr)
+
+		if _, err := conn.Do("SREM", gKey, sKey); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (r *SessionStore) RateLimitCount(client string, bucketRate, bucketCapacity float64) error {
