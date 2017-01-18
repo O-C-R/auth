@@ -5,6 +5,7 @@ import (
 	"encoding"
 	"encoding/gob"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/O-C-R/auth/id"
@@ -61,6 +62,10 @@ func interfaceToString(v interface{}) (string, error) {
 
 func sessionKey(sessionID id.ID) string {
 	return "s" + sessionID.String()
+}
+
+func sessionToGroupKey(sessionID id.ID) string {
+	return "z" + sessionID.String()
 }
 
 func groupKey(groupId string) string {
@@ -156,9 +161,15 @@ func (r *SessionStore) SetSession(sessionID id.ID, groupId interface{}, session 
 		if err != nil {
 			return err
 		}
-		gKey := groupKey(groupIdStr)
 
-		if _, err := conn.Do("SADD", gKey, sKey); err != nil {
+		gKey := groupKey(groupIdStr)
+		sgKey := sessionToGroupKey(sessionID)
+
+		if _, err := conn.Do("SETEX", sgKey, r.sessionDuration, groupIdStr); err != nil {
+			return err
+		}
+
+		if _, err := conn.Do("SADD", gKey, sKey, sgKey); err != nil {
 			return err
 		}
 
@@ -193,7 +204,7 @@ func (r *SessionStore) InvalidateSessions(groupId interface{}) error {
 	return nil
 }
 
-func (r *SessionStore) DeleteSession(sessionID id.ID, groupId interface{}) error {
+func (r *SessionStore) DeleteSession(sessionID id.ID) error {
 	conn := r.pool.Get()
 	defer conn.Close()
 
@@ -203,14 +214,16 @@ func (r *SessionStore) DeleteSession(sessionID id.ID, groupId interface{}) error
 		return err
 	}
 
-	if groupId != nil {
-		groupIdStr, err := interfaceToString(groupId)
-		if err != nil {
+	sgKey := sessionToGroupKey(sessionID)
+	groupId, err := redis.String(conn.Do("GET", sgKey))
+	if err == nil {
+		gKey := groupKey(groupId)
+
+		if _, err := conn.Do("DEL", sgKey); err != nil {
 			return err
 		}
-		gKey := groupKey(groupIdStr)
 
-		if _, err := conn.Do("SREM", gKey, sKey); err != nil {
+		if _, err := conn.Do("SREM", gKey, sKey, sgKey); err != nil {
 			return err
 		}
 	}
