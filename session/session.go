@@ -36,16 +36,27 @@ redis.call('pexpire', KEYS[1], math.ceil((ARGV[2] - bucket[2]) / ARGV[1] / 1e3))
 return ok
 `
 
+// Arguments: set name
+const deleteSetAndElements = `
+local members = redis.call('SMEMBERS', KEYS[1])
+redis.call('del', unpack(members))
+redis.call('del', KEYS[1])
+
+return 0
+`
+
 var (
-	RateLimitExceededError = errors.New("rate limit exceeded")
-	redisError             = errors.New("redis error")
-	tokenBucketScript      = redis.NewScript(1, tokenBucket)
+	InvalidStringError         = errors.New("Must provide a string-like object")
+	RateLimitExceededError     = errors.New("rate limit exceeded")
+	redisError                 = errors.New("redis error")
+	tokenBucketScript          = redis.NewScript(1, tokenBucket)
+	deleteSetAndElementsScript = redis.NewScript(1, deleteSetAndElements)
 )
 
 func interfaceToString(v interface{}) (string, error) {
 	switch v := v.(type) {
 	default:
-		return "", errors.New("Must provide a string-like object")
+		return "", InvalidStringError
 	case string:
 		return v, nil
 	case []byte:
@@ -117,8 +128,11 @@ func NewSessionStore(options SessionStoreOptions) (*SessionStore, error) {
 	conn := pool.Get()
 	defer conn.Close()
 
-	// Load the token bucket script.
+	// Load scripts
 	if err := tokenBucketScript.Load(conn); err != nil {
+		return nil, err
+	}
+	if err := deleteSetAndElementsScript.Load(conn); err != nil {
 		return nil, err
 	}
 
@@ -128,7 +142,7 @@ func NewSessionStore(options SessionStoreOptions) (*SessionStore, error) {
 	}, nil
 }
 
-func (r *SessionStore) Session(sessionID interface{}, session interface{}) error {
+func (r *SessionStore) Session(sessionID, session interface{}) error {
 	conn := r.pool.Get()
 	defer conn.Close()
 
@@ -144,7 +158,7 @@ func (r *SessionStore) Session(sessionID interface{}, session interface{}) error
 	return gob.NewDecoder(bytes.NewBuffer(reply)).Decode(session)
 }
 
-func (r *SessionStore) SetSession(sessionID interface{}, groupId interface{}, session interface{}) error {
+func (r *SessionStore) SetSession(sessionID, groupId, session interface{}) error {
 	conn := r.pool.Get()
 	defer conn.Close()
 
@@ -159,7 +173,9 @@ func (r *SessionStore) SetSession(sessionID interface{}, groupId interface{}, se
 	}
 	sKey := sessionKey(sessionIdStr)
 
-	if _, err := conn.Do("SETEX", sKey, r.sessionDuration, encodedSession); err != nil {
+	conn.Send("MULTI")
+
+	if err := conn.Send("SETEX", sKey, r.sessionDuration, encodedSession); err != nil {
 		return err
 	}
 
@@ -172,17 +188,21 @@ func (r *SessionStore) SetSession(sessionID interface{}, groupId interface{}, se
 		gKey := groupKey(groupIdStr)
 		sgKey := sessionToGroupKey(sessionIdStr)
 
-		if _, err := conn.Do("SETEX", sgKey, r.sessionDuration, groupIdStr); err != nil {
+		if err := conn.Send("SETEX", sgKey, r.sessionDuration, groupIdStr); err != nil {
 			return err
 		}
 
-		if _, err := conn.Do("SADD", gKey, sKey, sgKey); err != nil {
+		if err := conn.Send("SADD", gKey, sKey, sgKey); err != nil {
 			return err
 		}
 
-		if _, err := conn.Do("EXPIRE", gKey, r.sessionDuration); err != nil {
+		if err := conn.Send("EXPIRE", gKey, r.sessionDuration); err != nil {
 			return err
 		}
+	}
+
+	if _, err := conn.Do("EXEC"); err != nil {
+		return err
 	}
 
 	return nil
@@ -198,13 +218,7 @@ func (r *SessionStore) InvalidateSessions(groupId interface{}) error {
 	}
 	gKey := groupKey(groupIdStr)
 
-	// TODO: use sscan for safety
-	members, err := redis.Strings(conn.Do("SMEMBERS", gKey))
-	if err != nil {
-		return err
-	}
-
-	if _, err := conn.Do("DEL", redis.Args{}.Add(gKey).AddFlat(members)...); err != nil {
+	if _, err := deleteSetAndElementsScript.Do(conn, gKey); err != nil {
 		return err
 	}
 
