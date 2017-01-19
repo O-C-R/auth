@@ -5,7 +5,6 @@ import (
 	"encoding"
 	"encoding/gob"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -36,21 +35,69 @@ redis.call('pexpire', KEYS[1], math.ceil((ARGV[2] - bucket[2]) / ARGV[1] / 1e3))
 return ok
 `
 
-// Arguments: set name
-const deleteSetAndElements = `
-local members = redis.call('SMEMBERS', KEYS[1])
-redis.call('del', unpack(members))
+// Keys: sorted set name
+// Arguments: max length, [timestamp, member]...
+const addToCappedSortedSet = `
+local desiredSize = tonumber(ARGV[1])
+
+-- Swap in the key to the first param to zadd
+ARGV[1] = KEYS[1]
+redis.call('ZADD', unpack(ARGV))
+
+if desiredSize > 0 then
+	local size = redis.call('ZCARD', KEYS[1])
+	local maxRank = size - desiredSize - 1
+	if maxRank >= 0 then
+		local deleted = redis.call('ZREMRANGEBYRANK', KEYS[1], 0, maxRank)
+		return deleted
+	end
+end
+
+return 0
+`
+
+// Keys: sessionKey, sessionToGroupKey
+// Arguments: sessionId
+const deleteSingleSession = `
+redis.call('DEL', KEYS[1])
+local groupKey = redis.call('GET', KEYS[2])
+redis.call('DEL', KEYS[2])
+local deleted = redis.call('ZREM', groupKey, ARGV[1])
+
+return deleted
+`
+
+// Keys: sorted set name
+// Arguments: prefixes
+const deleteSortedSetAndKeys = `
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+
+local toDelete = {}
+local count = 0
+for midx, member in ipairs(members) do
+	for pidx, prefix in ipairs(ARGV) do
+		table.insert(toDelete, prefix .. member)
+		count = count + 1
+	end
+end
+
+if count > 0 then
+	redis.call('del', unpack(toDelete))
+end
+
 redis.call('del', KEYS[1])
 
 return 0
 `
 
 var (
-	InvalidStringError         = errors.New("Must provide a string-like object")
-	RateLimitExceededError     = errors.New("rate limit exceeded")
-	redisError                 = errors.New("redis error")
-	tokenBucketScript          = redis.NewScript(1, tokenBucket)
-	deleteSetAndElementsScript = redis.NewScript(1, deleteSetAndElements)
+	InvalidStringError           = errors.New("Must provide a string-like object")
+	RateLimitExceededError       = errors.New("rate limit exceeded")
+	redisError                   = errors.New("redis error")
+	tokenBucketScript            = redis.NewScript(1, tokenBucket)
+	addToCappedSortedSetScript   = redis.NewScript(1, addToCappedSortedSet)
+	deleteSingleSessionScript    = redis.NewScript(2, deleteSingleSession)
+	deleteSortedSetAndKeysScript = redis.NewScript(1, deleteSortedSetAndKeys)
 )
 
 func interfaceToString(v interface{}) (string, error) {
@@ -89,11 +136,13 @@ func rateLimitKey(client string) string {
 type SessionStoreOptions struct {
 	Addr, Password  string
 	SessionDuration time.Duration
+	MaxSessions     int
 }
 
 type SessionStore struct {
 	pool                                          *redis.Pool
 	sessionDuration, rateLimitDuration, rateLimit int64
+	maxSessions                                   int
 }
 
 func NewSessionStore(options SessionStoreOptions) (*SessionStore, error) {
@@ -132,13 +181,20 @@ func NewSessionStore(options SessionStoreOptions) (*SessionStore, error) {
 	if err := tokenBucketScript.Load(conn); err != nil {
 		return nil, err
 	}
-	if err := deleteSetAndElementsScript.Load(conn); err != nil {
+	if err := addToCappedSortedSetScript.Load(conn); err != nil {
+		return nil, err
+	}
+	if err := deleteSingleSessionScript.Load(conn); err != nil {
+		return nil, err
+	}
+	if err := deleteSortedSetAndKeysScript.Load(conn); err != nil {
 		return nil, err
 	}
 
 	return &SessionStore{
 		pool:            pool,
 		sessionDuration: int64(options.SessionDuration / time.Second),
+		maxSessions:     options.MaxSessions,
 	}, nil
 }
 
@@ -188,21 +244,23 @@ func (r *SessionStore) SetSession(sessionID, groupId, session interface{}) error
 		gKey := groupKey(groupIdStr)
 		sgKey := sessionToGroupKey(sessionIdStr)
 
-		if err := conn.Send("SETEX", sgKey, r.sessionDuration, groupIdStr); err != nil {
+		if err := conn.Send("SETEX", sgKey, r.sessionDuration, gKey); err != nil {
 			return err
 		}
 
-		if err := conn.Send("SADD", gKey, sKey, sgKey); err != nil {
-			return err
-		}
-
-		if err := conn.Send("EXPIRE", gKey, r.sessionDuration); err != nil {
+		if err := addToCappedSortedSetScript.Send(conn, gKey, r.maxSessions, time.Now().UnixNano(), sessionIdStr); err != nil {
 			return err
 		}
 	}
 
-	if _, err := conn.Do("EXEC"); err != nil {
+	res, err := redis.Values(conn.Do("EXEC"))
+	if err != nil {
 		return err
+	}
+	for _, elem := range res {
+		if err, ok := elem.(error); ok {
+			return err
+		}
 	}
 
 	return nil
@@ -218,7 +276,7 @@ func (r *SessionStore) InvalidateSessions(groupId interface{}) error {
 	}
 	gKey := groupKey(groupIdStr)
 
-	if _, err := deleteSetAndElementsScript.Do(conn, gKey); err != nil {
+	if _, err := deleteSortedSetAndKeysScript.Do(conn, gKey, "s", "z"); err != nil {
 		return err
 	}
 
@@ -234,23 +292,10 @@ func (r *SessionStore) DeleteSession(sessionID interface{}) error {
 		return err
 	}
 	sKey := sessionKey(sessionIdStr)
-
-	if _, err := conn.Do("DEL", sKey); err != nil {
-		return err
-	}
-
 	sgKey := sessionToGroupKey(sessionIdStr)
-	groupId, err := redis.String(conn.Do("GET", sgKey))
-	if err == nil {
-		gKey := groupKey(groupId)
 
-		if _, err := conn.Do("DEL", sgKey); err != nil {
-			return err
-		}
-
-		if _, err := conn.Do("SREM", gKey, sKey, sgKey); err != nil {
-			return err
-		}
+	if _, err := deleteSingleSessionScript.Do(conn, sKey, sgKey, sessionIdStr); err != nil {
+		return err
 	}
 
 	return nil
